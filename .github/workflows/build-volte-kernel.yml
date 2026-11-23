@@ -1,4 +1,4 @@
-name: Build UFI103S kernel with IMS crypto (VoLTE fix)
+name: Build UFI103S kernel with IMS crypto (VoLTE fix v2)
 
 on:
   workflow_dispatch:
@@ -16,6 +16,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: wip/msm8916/7.0
+          fetch-depth: 1
 
       - name: Install cross toolchain
         run: |
@@ -29,38 +30,56 @@ jobs:
             build-essential bc bison flex libssl-dev libncurses-dev gcc-aarch64-linux-gnu
           aarch64-linux-gnu-gcc --version
 
-      - name: Enable MD5 and NULL crypto for 3GPP IMS IPSec
+      - name: Build kernel (clean git tree => NO '+' suffix)
         run: |
           set -x
-          F=arch/arm64/configs/ufi103s_v03_defconfig
-          echo '--- before ---'
-          grep -n -E 'CONFIG_CRYPTO_(MD5|NULL)' "$F"
-          sed -i 's/^# CONFIG_CRYPTO_MD5 is not set$/CONFIG_CRYPTO_MD5=y/' "$F"
-          sed -i 's/^# CONFIG_CRYPTO_NULL is not set$/CONFIG_CRYPTO_NULL=y/' "$F"
-          echo '--- after ---'
-          grep -n -E 'CONFIG_CRYPTO_(MD5|NULL)' "$F"
-          grep -q '^CONFIG_CRYPTO_MD5=y$' "$F"
-          grep -q '^CONFIG_CRYPTO_NULL=y$' "$F"
-
-      - name: Build kernel
-        run: |
+          # Generate .config from defconfig. .config is gitignored, so the
+          # tracked source tree stays clean => setlocalversion adds no '+'.
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- ufi103s_v03_defconfig
+          # Patch ONLY .config (not the tracked defconfig file).
+          sed -i 's/^# CONFIG_CRYPTO_MD5 is not set$/CONFIG_CRYPTO_MD5=y/' .config
+          sed -i 's/^# CONFIG_CRYPTO_NULL is not set$/CONFIG_CRYPTO_NULL=y/' .config
+          echo '--- patched config ---'
+          grep -E 'CONFIG_CRYPTO_(MD5|NULL)=' .config
+          grep -q '^CONFIG_CRYPTO_MD5=y$' .config
+          grep -q '^CONFIG_CRYPTO_NULL=y$' .config
+          # Make sure git tree is clean (no dirty '+' version suffix)
+          echo '--- git status ---'
+          git status --porcelain
+          test -z "$(git status --porcelain)" || { echo 'ERROR: dirty tree'; exit 1; }
+          # Build kernel image and all modules
           make -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          # Install modules into a staging dir
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH=$PWD/modstaging modules_install
+          # Verify the exact release string (must be 7.0.0-spunckore, no '+')
+          echo '--- kernel release ---'
+          cat include/config/kernel.release
+          grep -qx '7.0.0-spunckore' include/config/kernel.release || \
+            { echo 'ERROR: unexpected kernel release (has + suffix?)'; exit 1; }
 
       - name: Collect artifacts
         run: |
+          set -x
           mkdir -p artifacts
           cp arch/arm64/boot/Image.gz artifacts/vmlinuz-7.0.0-spunckore
+          cp include/config/kernel.release artifacts/kernel.release
           cp System.map artifacts/
           cp .config artifacts/config-7.0.0-spunckore
           gzip -c .config > artifacts/config-7.0.0-spunckore.gz
-          find arch/arm64/boot/dts -name '*.dtb' -exec cp {} artifacts/ \; 2>/dev/null || true
+          # Ship freshly built modules too (belt and braces)
+          if [ -d modstaging/lib/modules ]; then
+            mkdir -p artifacts/modules
+            cp -a modstaging/lib/modules/* artifacts/modules/
+          fi
           echo '--- artifacts ---'
-          ls -lh artifacts
+          ls -lh artifacts/
+          echo '--- module count ---'
+          find artifacts/modules -name '*.ko*' 2>/dev/null | wc -l
 
       - name: Upload kernel
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-volte-7.0-spunckore
+          name: kernel-volte-v2-clean
           path: artifacts/
           if-no-files-found: error
